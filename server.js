@@ -6,18 +6,36 @@ const express = require("express");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
+const { merge3, stable } = require("./merge");
 
 const PORT = process.env.PORT || 3000;
 // ใส่โดเมนหน้าเว็บของคุณ เช่น https://yourname.github.io (คั่นหลายโดเมนด้วย ,) ไม่ใส่ = อนุญาตทุกที่
 const ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ORIGINS = ORIGIN === "*" ? null : ORIGIN.split(",").map((x) => x.trim().replace(/\/+$/, "")).filter(Boolean);
+if (!ORIGINS) console.log("คำเตือน: ยังไม่ได้ตั้ง ALLOWED_ORIGIN — ใครก็เรียกเซิร์ฟเวอร์นี้ได้ (ตั้งเป็นโดเมนหน้าเว็บของคุณ)");
+// ตั้ง EDIT_KEY แล้วเฉพาะเครื่องที่เปิดลิงก์แบบ ?k=<คีย์> จะแก้ได้ คนอื่นดูได้อย่างเดียว (ไม่ตั้ง = ใครมีลิงก์ก็แก้ได้เหมือนเดิม)
+const EDIT_KEY = process.env.EDIT_KEY || "";
+const sameKey = (a) => {
+  const x = Buffer.from(String(a || "")), y = Buffer.from(EDIT_KEY);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+const originOk = (o) => !ORIGINS || (!!o && ORIGINS.includes(String(o).replace(/\/+$/, "")));
 const FILE = process.env.DATA_FILE || path.join(__dirname, "state.json");
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: ORIGIN === "*" ? "*" : ORIGIN.split(",").map((s) => s.trim()) },
+  cors: { origin: ORIGINS || "*" },
+  // CORS ไม่กัน websocket จึงตรวจ Origin เองอีกชั้น
+  allowRequest: (req, cb) => cb(null, originOk(req.headers.origin)),
   maxHttpBufferSize: 1e6,
+});
+io.use((socket, next) => {
+  const a = socket.handshake.auth;
+  socket.data.ro = !!EDIT_KEY && !sameKey(a && a.key);
+  next();
 });
 
 // สถานะล่าสุด { state: "<JSON string>", at: เวลา }
@@ -26,6 +44,26 @@ try {
   current = JSON.parse(fs.readFileSync(FILE, "utf8"));
 } catch (e) {
   current = null;
+}
+// ประวัติสถานะล่าสุด (at -> state) ไว้เป็นฐานรวมการแก้ไขจากหลายเครื่อง
+const history = new Map();
+let historyBytes = 0;
+function remember(at, state) {
+  if (history.has(at)) return;
+  history.set(at, state);
+  historyBytes += state.length;
+  while (history.size > 40 || historyBytes > 8e6) {
+    const k = history.keys().next().value;
+    historyBytes -= history.get(k).length;
+    history.delete(k);
+  }
+}
+if (current && typeof current.state === "string") remember(current.at, current.state);
+
+// แคชแบบจำกัดขนาด กัน memory โตไม่หยุด
+function cacheSet(map, k, v, max = 500) {
+  if (map.size >= max) map.delete(map.keys().next().value);
+  map.set(k, v);
 }
 
 const GIST_ID = process.env.GIST_ID || "";
@@ -56,6 +94,7 @@ async function gistLoad() {
     const o = JSON.parse(txt);
     if (o && typeof o.state === "string" && (!current || o.at > current.at)) {
       current = { state: o.state, at: o.at };
+      remember(current.at, current.state);
       gistPushed = JSON.stringify(current);
       fs.writeFile(FILE, gistPushed, () => {});
       console.log("restored state from gist");
@@ -113,10 +152,10 @@ function geocode(q) {
   const job = geoChain.then(async () => {
     if (geoCache.has(q)) return geoCache.get(q);
     const u = NOMINATIM_URL + "?format=json&limit=1&countrycodes=th&q=" + encodeURIComponent(q);
-    const r = await fetch(u, { headers: { "User-Agent": "changmai-trip-sync/1.0 (personal trip planner)" } });
+    const r = await fetch(u, { headers: { "User-Agent": "changmai-trip-sync/1.0 (personal trip planner)" }, signal: AbortSignal.timeout(8000) });
     const j = await r.json();
     const pt = Array.isArray(j) && j[0] ? { lat: +j[0].lat, lon: +j[0].lon } : null;
-    if (pt) geoCache.set(q, pt);
+    if (pt) cacheSet(geoCache, q, pt);
     if (GAP) await new Promise((ok) => setTimeout(ok, GAP));
     return pt;
   });
@@ -132,7 +171,7 @@ async function osmLegs(p) {
     if (!pt) { const e = new Error("not_found"); e.place = q; throw e; }
     pts.push(pt);
   }
-  const r = await fetch(OSRM_URL + "/" + pts.map((x) => x.lon + "," + x.lat).join(";") + "?overview=false");
+  const r = await fetch(OSRM_URL + "/" + pts.map((x) => x.lon + "," + x.lat).join(";") + "?overview=false", { signal: AbortSignal.timeout(8000) });
   const j = await r.json();
   const legs = j && j.routes && j.routes[0] && j.routes[0].legs;
   if (!r.ok || !Array.isArray(legs) || legs.length !== p.length - 1) throw new Error("route_failed");
@@ -142,9 +181,11 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "20kb" }));
 app.use(["/route", "/search"], (req, res, next) => {
   const o = req.headers.origin;
-  if (o && (ORIGIN === "*" || ORIGIN.split(",").map((x) => x.trim()).includes(o))) {
+  if (o && !originOk(o)) return res.status(403).json({ error: "origin_not_allowed" });
+  if (o) {
     res.set("Access-Control-Allow-Origin", o);
     res.set("Access-Control-Allow-Headers", "content-type");
+    res.set("Vary", "Origin");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -157,6 +198,10 @@ function limited(ip) {
   if (!h || now > h.reset) { hits.set(ip, { n: 1, reset: now + 60000 }); return false; }
   return ++h.n > 20;
 }
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, h] of hits) if (now > h.reset) hits.delete(ip);
+}, 60000).unref();
 const searchCache = new Map();
 // ค้นหาสถานที่ให้เลือก (ฟรี ใช้ OpenStreetMap) — ใช้คิวเดียวกับการหาพิกัด เพื่อไม่เกิน 1 ครั้ง/วินาที
 app.get("/search", async (req, res) => {
@@ -169,7 +214,7 @@ app.get("/search", async (req, res) => {
       geoChain = geoChain.then(async () => {
         try {
           const u = NOMINATIM_URL + "?format=json&limit=5&addressdetails=0&accept-language=th&countrycodes=th&q=" + encodeURIComponent(q);
-          const r = await fetch(u, { headers: { "User-Agent": "changmai-trip-sync/1.0 (personal trip planner)" } });
+          const r = await fetch(u, { headers: { "User-Agent": "changmai-trip-sync/1.0 (personal trip planner)" }, signal: AbortSignal.timeout(8000) });
           const j = await r.json();
           ok((Array.isArray(j) ? j : []).map((x) => {
             const parts = String(x.display_name || "").split(",").map((t) => t.trim());
@@ -179,7 +224,7 @@ app.get("/search", async (req, res) => {
         if (GAP) await new Promise((r2) => setTimeout(r2, GAP));
       });
     });
-    searchCache.set(q, out);
+    cacheSet(searchCache, q, out);
     res.json({ results: out });
   } catch (e) {
     res.status(502).json({ error: "search_failed" });
@@ -196,14 +241,14 @@ app.post("/route", async (req, res) => {
     return res.status(400).json({ error: "bad_places" });
   }
   const key = p.join("\n");
-  if (routeCache.has(key)) return res.json({ legs: routeCache.get(key) });
+  if (routeCache.has(key)) return res.json({ legs: routeCache.get(key), source: GKEY ? "google" : "osm" });
   if (!GKEY) {
     try {
       const out = await osmLegs(p);
-      routeCache.set(key, out);
+      cacheSet(routeCache, key, out);
       return res.json({ legs: out, source: "osm" });
     } catch (e) {
-      return res.status(e.message === "not_found" ? 422 : 502).json({ error: e.message === "not_found" ? "not_found" : "google_failed", place: e.place });
+      return res.status(e.message === "not_found" ? 422 : 502).json({ error: e.message === "not_found" ? "not_found" : "route_failed", place: e.place });
     }
   }
   try {
@@ -233,8 +278,8 @@ app.post("/route", async (req, res) => {
       km: (l.distanceMeters || 0) / 1000,
       min: Math.round(parseInt(String(l.duration || "0"), 10) / 60),
     }));
-    routeCache.set(key, out);
-    res.json({ legs: out });
+    cacheSet(routeCache, key, out);
+    res.json({ legs: out, source: "google" });
   } catch (e) {
     res.status(502).json({ error: "google_failed" });
   }
@@ -258,24 +303,45 @@ io.on("connection", (socket) => {
     socket.emit("hello", {
       state: current ? current.state : null,
       at: current ? current.at : 0,
+      ro: !!socket.data.ro,
     })
   );
 
   socket.on("save", (msg, ack) => {
     const reply = typeof ack === "function" ? ack : () => {};
+    if (socket.data.ro) return reply({ ok: false, error: "readonly" });
     if (!msg || typeof msg.state !== "string" || msg.state.length > 900000) {
       return reply({ ok: false });
     }
+    let mine;
     try {
-      const o = JSON.parse(msg.state);
-      if (!o || !Array.isArray(o.days)) throw new Error("bad state");
+      mine = JSON.parse(msg.state);
+      if (!mine || !Array.isArray(mine.days)) throw new Error("bad state");
     } catch (e) {
       return reply({ ok: false });
     }
-    current = { state: msg.state, at: Date.now() };
-    persist();
-    socket.broadcast.emit("state", { state: current.state, at: current.at });
-    reply({ ok: true });
+    loaded.then(() => {
+      let out = msg.state;
+      let merged = false;
+      // เครื่องนี้แก้จากสถานะเก่า (มีคนอื่นบันทึกไปแล้ว) → รวมการแก้ไข ไม่เขียนทับทั้งก้อน
+      if (current && msg.base !== current.at && history.has(msg.base)) {
+        try {
+          const m = merge3(JSON.parse(history.get(msg.base)), JSON.parse(current.state), mine);
+          if (m && Array.isArray(m.days) && stable(m) !== stable(mine)) {
+            out = JSON.stringify(m);
+            merged = true;
+          }
+        } catch (e) {
+          out = msg.state;
+        }
+      }
+      const at = Math.max(Date.now(), current ? current.at + 1 : 0);
+      current = { state: out, at };
+      remember(at, out);
+      persist();
+      socket.broadcast.emit("state", { state: out, at });
+      reply(merged ? { ok: true, at, state: out } : { ok: true, at });
+    });
   });
 });
 

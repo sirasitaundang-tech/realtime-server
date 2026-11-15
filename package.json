@@ -1,11 +1,11 @@
 {
   "name": "changmai-sync",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/page.test.js test/sync.test.js"
+    "test": "node --test test/page.test.js test/sync.test.js test/merge.test.js"
   },
   "engines": {
     "node": ">=18"
